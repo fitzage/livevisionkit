@@ -109,7 +109,13 @@ jobs:
           $apiUrl  = "https://api.github.com/repos/obsproject/obs-studio/releases/tags/${{ env.OBS_VERSION }}"
           $release = Invoke-RestMethod $apiUrl -Headers $headers
           $zipAsset = $release.assets |
-            Where-Object { $_.name -like "*Windows*.zip" -and $_.name -notlike "*PDB*" } |
+            Where-Object {
+              $_.name -like "OBS-Studio-*.zip" -and
+              $_.name -notlike "*macOS*" -and
+              $_.name -notlike "*Ubuntu*" -and
+              $_.name -notlike "*pdbs*" -and
+              $_.name -notlike "*dSYM*"
+            } |
             Select-Object -First 1
 
           if (-not $zipAsset) {
@@ -154,10 +160,36 @@ jobs:
       - name: Configure
         shell: pwsh
         run: |
+          # Auto-discover OpenCV: find the root OpenCVConfig.cmake
+          # (the one directly under build/, not inside build/x64/vc*/lib/)
+          $cvConfig = Get-ChildItem -Recurse deps -Filter "OpenCVConfig.cmake" |
+            Where-Object {
+              $_.FullName -notlike "*sources*" -and
+              $_.FullName -notlike "*\vc1*\*"
+            } |
+            Sort-Object { $_.FullName.Length } |
+            Select-Object -First 1
+
+          if (-not $cvConfig) {
+            Write-Host "ERROR: OpenCVConfig.cmake not found. deps/ contents:"
+            Get-ChildItem -Recurse deps | Select-Object -ExpandProperty FullName
+            throw "OpenCVConfig.cmake not found in deps/"
+          }
+          $cvPath = $cvConfig.DirectoryName
+          Write-Host "OpenCV cmake config : $cvPath"
+          Write-Host "Eigen  install root : ${{ github.workspace }}\deps\eigen"
+          Write-Host "OBS    SDK root     : ${{ github.workspace }}\deps\obs-sdk"
+
+          # Verify OBS SDK files exist before running cmake
+          $obsInc = "${{ github.workspace }}\deps\obs-sdk\install\include"
+          $obsLib = "${{ github.workspace }}\deps\obs-sdk\install\bin\64bit\obs.lib"
+          if (-not (Test-Path $obsInc)) { throw "OBS include dir missing: $obsInc" }
+          if (-not (Test-Path $obsLib)) { throw "OBS import lib missing: $obsLib" }
+
           cmake -B build `
             -DCMAKE_BUILD_TYPE=Release `
             -DBUILD_VIDEO_EDITOR=OFF `
-            "-DOPENCV_BUILD_PATH=${{ github.workspace }}\deps\opencv\build" `
+            "-DOPENCV_BUILD_PATH=$cvPath" `
             "-DEIGEN_BUILD_PATH=${{ github.workspace }}\deps\eigen" `
             "-DOBS_BUILD_PATH=${{ github.workspace }}\deps\obs-sdk"
 
