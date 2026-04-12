@@ -81,7 +81,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: deps/obs-sdk
-          key: obs-sdk-${{ env.OBS_VERSION }}-win64
+          key: obs-sdk-${{ env.OBS_VERSION }}-win64-v2
 
       - name: Build OBS SDK (headers + import lib)
         if: steps.cache-obs.outputs.cache-hit != 'true'
@@ -134,22 +134,41 @@ jobs:
           if (-not $obsDll) { throw "obs.dll not found in release archive" }
           Write-Host "Found obs.dll: $obsDll"
 
-          # Parse dumpbin output — iterate lines directly for robustness
-          $dumpOutput = & dumpbin /EXPORTS "$obsDll" 2>&1
-          $names = @()
-          foreach ($line in $dumpOutput) {
-            if ($line -match '^\s+\d+\s+[0-9A-Fa-f]+\s+[0-9A-Fa-f]+\s+(\w+)\s*$') {
-              $names += $Matches[1]
-            }
-          }
-
-          Write-Host "Extracted $($names.Count) exports"
-
-          # Write DEF file
+          # Use Python (reliable cross-platform text parsing) to extract DLL exports
+          # and write the DEF file.  PowerShell + dumpbin 2>&1 has proven fragile.
           $defPath = "$binDir\obs.def"
-          "LIBRARY obs" | Out-File $defPath -Encoding ASCII
-          "EXPORTS"     | Out-File $defPath -Encoding ASCII -Append
-          $names        | Out-File $defPath -Encoding ASCII -Append
+          $pyScript = @'
+import subprocess, re, sys
+
+dll_path  = sys.argv[1]
+def_path  = sys.argv[2]
+
+proc = subprocess.run(
+    ['dumpbin', '/EXPORTS', dll_path],
+    capture_output=True, text=True, errors='replace'
+)
+names = []
+for line in proc.stdout.splitlines():
+    # Export entry lines look like:
+    #   "          1    0 000037C0 obs_add_data_path"
+    # ordinal=decimal  hint=decimal  RVA=8 hex chars  name=identifier
+    m = re.match(r'^\s+\d+\s+[0-9A-Fa-f]+\s+[0-9A-Fa-f]{8}\s+(\w+)\s*$', line)
+    if m:
+        names.append(m.group(1))
+
+print(f'Extracted {len(names)} exports', flush=True)
+if not names:
+    print('ERROR: no exports found – check dumpbin output above', flush=True)
+    sys.exit(1)
+
+with open(def_path, 'w', newline='\n') as f:
+    f.write('LIBRARY obs\nEXPORTS\n')
+    for n in names:
+        f.write(n + '\n')
+'@
+          Set-Content -Path "gen_def.py" -Value $pyScript -Encoding ASCII
+          python gen_def.py "$obsDll" "$defPath"
+          if ($LASTEXITCODE -ne 0) { throw "DEF generation failed" }
 
           # Generate import library
           $libPath = "$binDir\obs.lib"
