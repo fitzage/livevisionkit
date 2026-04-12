@@ -8,6 +8,7 @@ on:
 env:
   OBS_VERSION:    "30.1.2"
   OPENCV_VERSION: "4.10.0"
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 # ============================================================================
 jobs:
@@ -95,9 +96,9 @@ jobs:
           New-Item -ItemType Directory -Force -Path $incDir | Out-Null
           New-Item -ItemType Directory -Force -Path $binDir | Out-Null
 
-          # Copy all public headers from libobs/ (obs.h, obs-module.h, …)
-          Get-ChildItem -Path "deps\obs-src\libobs" -Filter "*.h" |
-            Copy-Item -Destination $incDir
+          # Copy all of libobs/ recursively (obs.h, obs-module.h, util/, graphics/, media-io/, …)
+          # obs.h uses relative includes like "util/c99defs.h" so subdirs must be present
+          Copy-Item -Path "deps\obs-src\libobs\*" -Destination $incDir -Recurse -Force
 
           # ── obs.dll → obs.lib ──
           # Use the GitHub API to find the exact portable-zip asset name,
