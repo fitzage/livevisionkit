@@ -216,7 +216,7 @@ jobs:
           sudo apt-get install -y \
             cmake g++ \
             libopencv-dev libeigen3-dev qtbase5-dev libqt5opengl5-dev \
-            obs-studio libobs-dev
+            libobs-dev
 
       # Arrange system OBS files into the directory tree LVK CMakeLists expects:
       #   fake-obs/install/include/obs/   ← headers (from /usr/include/obs/)
