@@ -189,6 +189,20 @@ jobs:
       - name: Install
         run: cmake --install build --config Release
 
+      # Bundle the OpenCV world DLL so users can drag-and-drop the artifact
+      # folder onto their OBS installation without installing OpenCV separately.
+      - name: Bundle OpenCV runtime DLL
+        shell: pwsh
+        run: |
+          $cvDll = Get-ChildItem -Recurse deps/opencv -Filter "opencv_world*.dll" |
+            Where-Object { $_.FullName -like "*\x64\*" -and $_.FullName -notlike "*d.dll" } |
+            Select-Object -First 1
+          if (-not $cvDll) { throw "opencv_world DLL not found" }
+          Write-Host "Bundling: $($cvDll.FullName)"
+          $dest = Get-ChildItem -Recurse "build/Install" -Filter "lvk-obs.dll" |
+            Select-Object -First 1 -ExpandProperty DirectoryName
+          Copy-Item $cvDll.FullName $dest
+
       # Artifact layout mirrors OBS's plugin folder structure so users can
       # drag-and-drop it onto their OBS installation directory.
       - name: Upload artifact
