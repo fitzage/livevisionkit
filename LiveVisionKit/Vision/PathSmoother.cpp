@@ -42,6 +42,7 @@ namespace lvk
         LVK_ASSERT(settings.predictive_samples > 0);
         LVK_ASSERT(settings.smoothing_steps > 0.0f);
         LVK_ASSERT_01(settings.response_rate);
+        LVK_ASSERT_01(settings.release_rate);
 
         // Update motion resolution.
         if(m_Position.size() != settings.motion_resolution)
@@ -124,11 +125,15 @@ namespace lvk
             max_drift_error = 1.0f;
         }
 
-        // Adapt the smoothing factor to target a drift of 0.5.
+        // Adapt the smoothing factor to target a drift of 0.5, using separate rates for
+        // engaging correction (attack) and releasing it (release). A faster release_rate
+        // means the filter exits correction mode quickly once drift drops, which avoids
+        // the prolonged wobble seen after momentary/transient vibration events.
+        const double target_factor = hysteresis<double>(max_drift_error, 0.3, m_Settings.smoothing_steps, 0.7, 0.0);
         m_SmoothingFactor = exp_moving_average(
             m_SmoothingFactor,
-            hysteresis<double>(max_drift_error, 0.3, m_Settings.smoothing_steps, 0.7, 0.0),
-            m_Settings.response_rate
+            target_factor,
+            (target_factor > m_SmoothingFactor) ? m_Settings.release_rate : m_Settings.response_rate
         );
 
         return std::move(path_correction);

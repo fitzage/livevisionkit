@@ -36,6 +36,7 @@ namespace lvk
         // Smoothing Characteristics
         float smoothing_steps = 20.0f;
         float response_rate = 0.04f;
+        float release_rate = 0.04f;
     };
 
     class PathSmoother final : public Configurable<PathSmootherSettings>

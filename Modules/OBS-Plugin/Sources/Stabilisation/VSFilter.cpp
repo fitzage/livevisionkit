@@ -28,9 +28,21 @@ namespace lvk
 
 	constexpr auto PROP_PREDICTIVE_SAMPLES = "SMOOTH_RADIUS";
 	constexpr auto PROP_PREDICTIVE_SAMPLES_DEFAULT = "10";
-    constexpr std::array<const char*,7> PROP_PREDICTIVE_SAMPLES_OPTIONS = {
-        "5", "10", "15", "20", "30", "40", "60"
+    constexpr std::array<const char*,8> PROP_PREDICTIVE_SAMPLES_OPTIONS = {
+        "3", "5", "10", "15", "20", "30", "40", "60"
     };
+
+    constexpr auto PROP_MOTION_PROFILE = "MOTION_PROFILE";
+    constexpr auto PROP_MOTION_PROFILE_TRANSIENT = "MP_TRANSIENT";
+    constexpr auto PROP_MOTION_PROFILE_CONTINUOUS = "MP_CONTINUOUS";
+    constexpr auto PROP_MOTION_PROFILE_DEFAULT = PROP_MOTION_PROFILE_TRANSIENT;
+
+    // Transient: fast release avoids prolonged correction after a momentary bump
+    constexpr float MOTION_PROFILE_TRANSIENT_RESPONSE_RATE = 0.15f;
+    constexpr float MOTION_PROFILE_TRANSIENT_RELEASE_RATE  = 0.40f;
+    // Continuous: original slow rates, designed for sustained/ongoing hand-shake
+    constexpr float MOTION_PROFILE_CONTINUOUS_RESPONSE_RATE = 0.04f;
+    constexpr float MOTION_PROFILE_CONTINUOUS_RELEASE_RATE  = 0.04f;
 
 	constexpr auto PROP_STREAM_DELAY_INFO = "STREAM_DELAY_INFO";
 	constexpr auto PROP_STREAM_DELAY_INFO_MAX = 60000;
@@ -121,6 +133,17 @@ namespace lvk
         obs_property_list_add_string(property, L("vs.qa.relaxed"), PROP_QUALITY_ASSURANCE_RELAXED);
         obs_property_list_add_string(property, L("vs.qa.strict"), PROP_QUALITY_ASSURANCE_STRICT);
 
+        // Motion Profile
+        property = obs_properties_add_list(
+            properties,
+            PROP_MOTION_PROFILE,
+            L("vs.motion-profile"),
+            OBS_COMBO_TYPE_LIST,
+            OBS_COMBO_FORMAT_STRING
+        );
+        obs_property_list_add_string(property, L("vs.motion-profile.transient"),  PROP_MOTION_PROFILE_TRANSIENT);
+        obs_property_list_add_string(property, L("vs.motion-profile.continuous"), PROP_MOTION_PROFILE_CONTINUOUS);
+
 
         // Independent crop toggle
         property = obs_properties_add_bool(
@@ -207,8 +230,9 @@ namespace lvk
 	{
 		LVK_ASSERT(settings != nullptr);
 
-        obs_data_set_default_string(settings,PROP_PREDICTIVE_SAMPLES, PROP_PREDICTIVE_SAMPLES_DEFAULT);
+        obs_data_set_default_string(settings, PROP_PREDICTIVE_SAMPLES, PROP_PREDICTIVE_SAMPLES_DEFAULT);
         obs_data_set_default_string(settings, PROP_QUALITY_ASSURANCE, PROP_QUALITY_ASSURANCE_DEFAULT);
+        obs_data_set_default_string(settings, PROP_MOTION_PROFILE, PROP_MOTION_PROFILE_DEFAULT);
 		obs_data_set_default_int(settings, PROP_BACKGROUND_COLOUR, PROP_BACKGROUND_COLOUR_DEFAULT);
         obs_data_set_default_double(settings, PROP_CROP_PERCENTAGE_X, PROP_CROP_PERCENTAGE_DEFAULT);
         obs_data_set_default_double(settings, PROP_CROP_PERCENTAGE_Y, PROP_CROP_PERCENTAGE_DEFAULT);
@@ -290,6 +314,19 @@ namespace lvk
             {
                 stab_settings.min_scene_quality = 0.40f;
                 stab_settings.min_tracking_quality = 0.20f;
+            }
+
+            // Configure motion profile (controls correction attack/release speed)
+            const std::string motion_profile = obs_data_get_string(settings, PROP_MOTION_PROFILE);
+            if(motion_profile == PROP_MOTION_PROFILE_CONTINUOUS)
+            {
+                stab_settings.response_rate = MOTION_PROFILE_CONTINUOUS_RESPONSE_RATE;
+                stab_settings.release_rate  = MOTION_PROFILE_CONTINUOUS_RELEASE_RATE;
+            }
+            else
+            {
+                stab_settings.response_rate = MOTION_PROFILE_TRANSIENT_RESPONSE_RATE;
+                stab_settings.release_rate  = MOTION_PROFILE_TRANSIENT_RELEASE_RATE;
             }
 		});
 
