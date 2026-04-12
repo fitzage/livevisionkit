@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
 
 env:
-  OBS_VERSION:    "28.1.2"
+  OBS_VERSION:    "30.1.2"
   OPENCV_VERSION: "4.10.0"
 
 # ============================================================================
@@ -100,10 +100,25 @@ jobs:
             Copy-Item -Destination $incDir
 
           # ── obs.dll → obs.lib ──
-          $releaseZip = "obs-release.zip"
-          $releaseUrl = "https://github.com/obsproject/obs-studio/releases/download/${{ env.OBS_VERSION }}/OBS-Studio-${{ env.OBS_VERSION }}-Windows.zip"
-          Invoke-WebRequest $releaseUrl -OutFile $releaseZip
-          Expand-Archive $releaseZip -DestinationPath "deps\obs-release"
+          # Use the GitHub API to find the exact portable-zip asset name,
+          # so we never hardcode a filename that might not exist for a given tag.
+          $headers = @{
+            'Accept'        = 'application/vnd.github.v3+json'
+            'Authorization' = "Bearer ${{ github.token }}"
+          }
+          $apiUrl  = "https://api.github.com/repos/obsproject/obs-studio/releases/tags/${{ env.OBS_VERSION }}"
+          $release = Invoke-RestMethod $apiUrl -Headers $headers
+          $zipAsset = $release.assets |
+            Where-Object { $_.name -like "*Windows*.zip" -and $_.name -notlike "*PDB*" } |
+            Select-Object -First 1
+
+          if (-not $zipAsset) {
+            $names = ($release.assets | ForEach-Object { $_.name }) -join ', '
+            throw "No Windows zip asset found. Available: $names"
+          }
+          Write-Host "Downloading: $($zipAsset.name)"
+          Invoke-WebRequest $zipAsset.browser_download_url -OutFile obs-release.zip
+          Expand-Archive obs-release.zip -DestinationPath "deps\obs-release"
 
           $obsDll = Get-ChildItem -Recurse "deps\obs-release" -Filter "obs.dll" |
             Where-Object { $_.DirectoryName -like "*64bit*" } |
@@ -112,11 +127,14 @@ jobs:
           if (-not $obsDll) { throw "obs.dll not found in release archive" }
           Write-Host "Found obs.dll: $obsDll"
 
-          # Parse dumpbin output to get exported symbol names
-          $dumpOutput = & dumpbin /EXPORTS $obsDll
-          $names = $dumpOutput |
-            Select-String '^\s+\d+\s+[0-9A-Fa-f]+\s+[0-9A-Fa-f]+\s+(\w+)\s*$' |
-            ForEach-Object { $_.Matches[0].Groups[1].Value }
+          # Parse dumpbin output — iterate lines directly for robustness
+          $dumpOutput = & dumpbin /EXPORTS "$obsDll" 2>&1
+          $names = @()
+          foreach ($line in $dumpOutput) {
+            if ($line -match '^\s+\d+\s+[0-9A-Fa-f]+\s+[0-9A-Fa-f]+\s+(\w+)\s*$') {
+              $names += $Matches[1]
+            }
+          }
 
           Write-Host "Extracted $($names.Count) exports"
 
@@ -175,7 +193,7 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y \
             cmake g++ \
-            libopencv-dev libeigen3-dev qtbase5-dev \
+            libopencv-dev libeigen3-dev qtbase5-dev libqt5opengl5-dev \
             obs-studio libobs-dev
 
       # Arrange system OBS files into the directory tree LVK CMakeLists expects:
