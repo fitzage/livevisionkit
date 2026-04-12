@@ -1,0 +1,217 @@
+name: Build OBS Plugin
+
+on:
+  push:
+    branches: ['**']
+  workflow_dispatch:
+
+env:
+  OBS_VERSION:    "28.1.2"
+  OPENCV_VERSION: "4.10.0"
+
+# ============================================================================
+jobs:
+
+  # --------------------------------------------------------------------------
+  # Windows x64
+  # --------------------------------------------------------------------------
+  build-windows:
+    name: Windows x64
+    runs-on: windows-2022
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # MSVC tools (dumpbin, lib) must be in PATH for the OBS SDK step
+      - name: Set up MSVC x64
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      # ── OpenCV pre-built Windows binary ────────────────────────────────────
+      - name: Cache OpenCV
+        id: cache-opencv
+        uses: actions/cache@v4
+        with:
+          path: deps/opencv
+          key: opencv-${{ env.OPENCV_VERSION }}-win64
+
+      - name: Download & extract OpenCV
+        if: steps.cache-opencv.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          $url = "https://github.com/opencv/opencv/releases/download/${{ env.OPENCV_VERSION }}/opencv-${{ env.OPENCV_VERSION }}-windows.exe"
+          Invoke-WebRequest $url -OutFile opencv.exe
+          # The SFX extracts an "opencv/" directory into the target folder
+          & 7z x opencv.exe -o"deps" -y | Out-Null
+
+      # ── Eigen3 (header-only, cmake install) ────────────────────────────────
+      - name: Cache Eigen3
+        id: cache-eigen
+        uses: actions/cache@v4
+        with:
+          path: deps/eigen
+          key: eigen-3.4.0
+
+      - name: Install Eigen3
+        if: steps.cache-eigen.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          git clone --depth 1 --branch 3.4.0 `
+            https://gitlab.com/libeigen/eigen.git deps/eigen-src
+          cmake -B deps/eigen-build -S deps/eigen-src `
+            "-DCMAKE_INSTALL_PREFIX=${{ github.workspace }}\deps\eigen"
+          cmake --install deps/eigen-build
+
+      # ── OBS SDK: headers from source + obs.lib generated from release DLL ──
+      #
+      # We avoid a full OBS source build (which needs its own bundled deps).
+      # Instead:
+      #   1. Clone OBS at the pinned tag  →  copy libobs/*.h as headers
+      #   2. Download the OBS portable release  →  get obs.dll
+      #   3. Use dumpbin + lib.exe (MSVC)  →  generate obs.lib
+      #
+      # The resulting tree matches what LVK's CMakeLists.txt expects:
+      #   deps/obs-sdk/install/include/   ← obs.h, obs-module.h, …
+      #   deps/obs-sdk/install/bin/64bit/ ← obs.lib
+      # ───────────────────────────────────────────────────────────────────────
+      - name: Cache OBS SDK
+        id: cache-obs
+        uses: actions/cache@v4
+        with:
+          path: deps/obs-sdk
+          key: obs-sdk-${{ env.OBS_VERSION }}-win64
+
+      - name: Build OBS SDK (headers + import lib)
+        if: steps.cache-obs.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          # ── Headers ──
+          git clone --depth 1 --branch ${{ env.OBS_VERSION }} `
+            https://github.com/obsproject/obs-studio.git deps/obs-src
+
+          $incDir = "deps\obs-sdk\install\include"
+          $binDir = "deps\obs-sdk\install\bin\64bit"
+          New-Item -ItemType Directory -Force -Path $incDir | Out-Null
+          New-Item -ItemType Directory -Force -Path $binDir | Out-Null
+
+          # Copy all public headers from libobs/ (obs.h, obs-module.h, …)
+          Get-ChildItem -Path "deps\obs-src\libobs" -Filter "*.h" |
+            Copy-Item -Destination $incDir
+
+          # ── obs.dll → obs.lib ──
+          $releaseZip = "obs-release.zip"
+          $releaseUrl = "https://github.com/obsproject/obs-studio/releases/download/${{ env.OBS_VERSION }}/OBS-Studio-${{ env.OBS_VERSION }}-Windows.zip"
+          Invoke-WebRequest $releaseUrl -OutFile $releaseZip
+          Expand-Archive $releaseZip -DestinationPath "deps\obs-release"
+
+          $obsDll = Get-ChildItem -Recurse "deps\obs-release" -Filter "obs.dll" |
+            Where-Object { $_.DirectoryName -like "*64bit*" } |
+            Select-Object -First 1 -ExpandProperty FullName
+
+          if (-not $obsDll) { throw "obs.dll not found in release archive" }
+          Write-Host "Found obs.dll: $obsDll"
+
+          # Parse dumpbin output to get exported symbol names
+          $dumpOutput = & dumpbin /EXPORTS $obsDll
+          $names = $dumpOutput |
+            Select-String '^\s+\d+\s+[0-9A-Fa-f]+\s+[0-9A-Fa-f]+\s+(\w+)\s*$' |
+            ForEach-Object { $_.Matches[0].Groups[1].Value }
+
+          Write-Host "Extracted $($names.Count) exports"
+
+          # Write DEF file
+          $defPath = "$binDir\obs.def"
+          "LIBRARY obs" | Out-File $defPath -Encoding ASCII
+          "EXPORTS"     | Out-File $defPath -Encoding ASCII -Append
+          $names        | Out-File $defPath -Encoding ASCII -Append
+
+          # Generate import library
+          $libPath = "$binDir\obs.lib"
+          & lib /DEF:$defPath /OUT:$libPath /MACHINE:X64
+          if ($LASTEXITCODE -ne 0) { throw "lib.exe failed" }
+          Write-Host "Generated $libPath"
+
+      # ── Configure & build LVK ─────────────────────────────────────────────
+      - name: Configure
+        shell: pwsh
+        run: |
+          cmake -B build `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DBUILD_VIDEO_EDITOR=OFF `
+            "-DOPENCV_BUILD_PATH=${{ github.workspace }}\deps\opencv\build" `
+            "-DEIGEN_BUILD_PATH=${{ github.workspace }}\deps\eigen" `
+            "-DOBS_BUILD_PATH=${{ github.workspace }}\deps\obs-sdk"
+
+      - name: Build
+        run: cmake --build build --config Release -j4
+
+      - name: Install
+        run: cmake --install build --config Release
+
+      # Artifact layout mirrors OBS's plugin folder structure so users can
+      # drag-and-drop it onto their OBS installation directory.
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: LiveVisionKit-Windows-x64
+          path: build/Install/Releases/
+
+  # --------------------------------------------------------------------------
+  # Linux x64
+  # --------------------------------------------------------------------------
+  build-linux:
+    name: Linux x64
+    runs-on: ubuntu-22.04
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # Use the official OBS PPA — gives us pre-built libobs headers & .so,
+      # avoiding a from-source OBS build in CI entirely.
+      - name: Add OBS PPA & install system dependencies
+        run: |
+          sudo add-apt-repository ppa:obsproject/obs-studio -y
+          sudo apt-get update -qq
+          sudo apt-get install -y \
+            cmake g++ \
+            libopencv-dev libeigen3-dev qtbase5-dev \
+            obs-studio libobs-dev
+
+      # Arrange system OBS files into the directory tree LVK CMakeLists expects:
+      #   fake-obs/install/include/obs/   ← headers (from /usr/include/obs/)
+      #   fake-obs/install/lib/           ← libobs.so
+      - name: Create OBS SDK layout
+        run: |
+          mkdir -p fake-obs/install/include
+          mkdir -p fake-obs/install/lib
+
+          cp -r /usr/include/obs fake-obs/install/include/
+
+          OBS_SO=$(find /usr/lib -name "libobs.so" 2>/dev/null | head -1)
+          if [ -z "$OBS_SO" ]; then
+            OBS_SO=$(find /usr/lib -name "libobs.so.*" 2>/dev/null | head -1)
+          fi
+          echo "Using libobs: $OBS_SO"
+          cp "$OBS_SO" fake-obs/install/lib/libobs.so
+
+      - name: Configure
+        run: |
+          cmake -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_VIDEO_EDITOR=OFF \
+            -DOPENCV_BUILD_PATH=/usr/lib/x86_64-linux-gnu/cmake/opencv4 \
+            -DEIGEN_BUILD_PATH=/usr/share/eigen3/cmake \
+            -DOBS_BUILD_PATH=$(pwd)/fake-obs
+
+      - name: Build
+        run: cmake --build build -j$(nproc)
+
+      - name: Install
+        run: cmake --install build
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: LiveVisionKit-Linux-x64
+          path: build/Install/Releases/
