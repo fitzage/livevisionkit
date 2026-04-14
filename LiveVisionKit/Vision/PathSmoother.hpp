@@ -37,6 +37,14 @@ namespace lvk
         float smoothing_steps = 20.0f;
         float response_rate = 0.04f;
         float release_rate = 0.04f;
+
+        // Anchor mode: zero-latency EMA anchor suited for fixed/PTZ cameras.
+        // All motion is treated as vibration and corrected back to a slowly-
+        // drifting anchor point.  anchor_decay controls how fast the anchor
+        // follows sustained (intentional) camera moves: lower = more stable
+        // but slower to accept a deliberate PTZ repositioning.
+        bool  anchor_mode  = false;
+        float anchor_decay = 0.003f;
     };
 
     class PathSmoother final : public Configurable<PathSmootherSettings>
@@ -63,6 +71,7 @@ namespace lvk
         StreamBuffer<WarpMesh> m_Trajectory{1};
         WarpMesh m_Trace{WarpMesh::MinimumSize};
         WarpMesh m_Position{WarpMesh::MinimumSize};
+        WarpMesh m_Anchor{WarpMesh::MinimumSize};
 
         cv::Rect2f m_SceneMargins{0,0,0,0};
         WarpMesh m_SceneCrop{WarpMesh::MinimumSize};

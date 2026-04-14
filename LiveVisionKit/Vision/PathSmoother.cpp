@@ -43,6 +43,11 @@ namespace lvk
         LVK_ASSERT(settings.smoothing_steps > 0.0f);
         LVK_ASSERT_01(settings.response_rate);
         LVK_ASSERT_01(settings.release_rate);
+        LVK_ASSERT_01(settings.anchor_decay);
+
+        // Reset state when switching between anchor and path-smoothing modes.
+        if(m_Settings.anchor_mode != settings.anchor_mode)
+            restart();
 
         // Update motion resolution.
         if(m_Position.size() != settings.motion_resolution)
@@ -50,6 +55,7 @@ namespace lvk
             m_Trajectory.fill(settings.motion_resolution);
             m_Trace = WarpMesh(settings.motion_resolution);
             m_Position = WarpMesh(settings.motion_resolution);
+            m_Anchor = WarpMesh(settings.motion_resolution);
         }
 
         // Update trajectory sizing.
@@ -85,6 +91,27 @@ namespace lvk
     WarpMesh PathSmoother::next(const WarpMesh& motion)
     {
         LVK_ASSERT(motion.size() == m_Settings.motion_resolution);
+
+        // ── Anchor mode (fixed/PTZ camera) ───────────────────────────────────
+        // Zero latency.  Accumulates the camera path and maintains a very slow
+        // EMA anchor.  Any deviation from the anchor is treated as vibration
+        // and corrected.  The anchor drifts toward the current position at
+        // anchor_decay per frame, so deliberate PTZ moves are gradually accepted.
+        if(m_Settings.anchor_mode)
+        {
+            m_Position += motion;
+
+            // anchor += anchor_decay * (position - anchor)
+            auto drift = m_Position - m_Anchor;
+            drift *= m_Settings.anchor_decay;
+            m_Anchor += drift;
+
+            // Correction pushes the frame back toward the anchor.
+            auto correction = m_Anchor - m_Position;
+            correction.clamp(m_SceneMargins.tl());
+            return std::move(correction);
+        }
+        // ─────────────────────────────────────────────────────────────────────
 
         // Update the path's current state.
         m_Position -= m_Trajectory.oldest();
@@ -147,13 +174,14 @@ namespace lvk
         for(auto& motion : m_Trajectory) motion.set_identity();
         m_Position.set_identity();
         m_Trace.set_identity();
+        m_Anchor.set_identity();
     }
 
 //---------------------------------------------------------------------------------------------------------------------
 
     size_t PathSmoother::time_delay() const
     {
-        return m_Settings.predictive_samples;
+        return m_Settings.anchor_mode ? 0 : m_Settings.predictive_samples;
     }
 
 //---------------------------------------------------------------------------------------------------------------------

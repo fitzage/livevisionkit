@@ -35,6 +35,7 @@ namespace lvk
     constexpr auto PROP_MOTION_PROFILE = "MOTION_PROFILE";
     constexpr auto PROP_MOTION_PROFILE_TRANSIENT = "MP_TRANSIENT";
     constexpr auto PROP_MOTION_PROFILE_CONTINUOUS = "MP_CONTINUOUS";
+    constexpr auto PROP_MOTION_PROFILE_FIXED = "MP_FIXED";
     constexpr auto PROP_MOTION_PROFILE_DEFAULT = PROP_MOTION_PROFILE_TRANSIENT;
 
     // Transient: fast release avoids prolonged correction after a momentary bump
@@ -43,6 +44,10 @@ namespace lvk
     // Continuous: original slow rates, designed for sustained/ongoing hand-shake
     constexpr float MOTION_PROFILE_CONTINUOUS_RESPONSE_RATE = 0.04f;
     constexpr float MOTION_PROFILE_CONTINUOUS_RELEASE_RATE  = 0.04f;
+    // Fixed Camera: EMA anchor — zero latency, treats all motion as vibration.
+    // anchor_decay controls how fast the anchor accepts intentional PTZ moves.
+    // 0.003/frame ≈ 11-second time constant at 30 fps.
+    constexpr float MOTION_PROFILE_FIXED_ANCHOR_DECAY = 0.003f;
 
 	constexpr auto PROP_STREAM_DELAY_INFO = "STREAM_DELAY_INFO";
 	constexpr auto PROP_STREAM_DELAY_INFO_MAX = 60000;
@@ -143,6 +148,7 @@ namespace lvk
         );
         obs_property_list_add_string(property, L("vs.motion-profile.transient"),  PROP_MOTION_PROFILE_TRANSIENT);
         obs_property_list_add_string(property, L("vs.motion-profile.continuous"), PROP_MOTION_PROFILE_CONTINUOUS);
+        obs_property_list_add_string(property, L("vs.motion-profile.fixed"),      PROP_MOTION_PROFILE_FIXED);
 
 
         // Independent crop toggle
@@ -316,17 +322,26 @@ namespace lvk
                 stab_settings.min_tracking_quality = 0.20f;
             }
 
-            // Configure motion profile (controls correction attack/release speed)
+            // Configure motion profile (controls correction strategy)
             const std::string motion_profile = obs_data_get_string(settings, PROP_MOTION_PROFILE);
-            if(motion_profile == PROP_MOTION_PROFILE_CONTINUOUS)
+            if(motion_profile == PROP_MOTION_PROFILE_FIXED)
             {
-                stab_settings.response_rate = MOTION_PROFILE_CONTINUOUS_RESPONSE_RATE;
-                stab_settings.release_rate  = MOTION_PROFILE_CONTINUOUS_RELEASE_RATE;
+                stab_settings.anchor_mode  = true;
+                stab_settings.anchor_decay = MOTION_PROFILE_FIXED_ANCHOR_DECAY;
             }
             else
             {
-                stab_settings.response_rate = MOTION_PROFILE_TRANSIENT_RESPONSE_RATE;
-                stab_settings.release_rate  = MOTION_PROFILE_TRANSIENT_RELEASE_RATE;
+                stab_settings.anchor_mode = false;
+                if(motion_profile == PROP_MOTION_PROFILE_CONTINUOUS)
+                {
+                    stab_settings.response_rate = MOTION_PROFILE_CONTINUOUS_RESPONSE_RATE;
+                    stab_settings.release_rate  = MOTION_PROFILE_CONTINUOUS_RELEASE_RATE;
+                }
+                else // Transient (default)
+                {
+                    stab_settings.response_rate = MOTION_PROFILE_TRANSIENT_RESPONSE_RATE;
+                    stab_settings.release_rate  = MOTION_PROFILE_TRANSIENT_RELEASE_RATE;
+                }
             }
 		});
 
