@@ -55,6 +55,12 @@ namespace lvk
     constexpr float PROP_ANCHOR_SNAP_THRESHOLD_MAX     = 5.0f;
     constexpr float PROP_ANCHOR_SNAP_THRESHOLD_STEP    = 0.1f;
 
+    constexpr auto  PROP_SCENE_CHANGE_DELAY         = "SCENE_CHANGE_DELAY";
+    constexpr float PROP_SCENE_CHANGE_DELAY_DEFAULT = 5.0f;   // seconds
+    constexpr float PROP_SCENE_CHANGE_DELAY_MIN     = 0.0f;
+    constexpr float PROP_SCENE_CHANGE_DELAY_MAX     = 30.0f;
+    constexpr float PROP_SCENE_CHANGE_DELAY_STEP    = 0.5f;
+
 	constexpr auto PROP_STREAM_DELAY_INFO = "STREAM_DELAY_INFO";
 	constexpr auto PROP_STREAM_DELAY_INFO_MAX = 60000;
 	constexpr auto PROP_STREAM_DELAY_INFO_MIN = 0;
@@ -169,6 +175,18 @@ namespace lvk
         obs_property_float_set_suffix(property, "%");
         obs_property_set_visible(property, false);  // hidden until Fixed Camera is selected
 
+        // Scene Change Delay (visible only for Fixed Camera profile)
+        property = obs_properties_add_float_slider(
+            properties,
+            PROP_SCENE_CHANGE_DELAY,
+            L("vs.scene-delay"),
+            PROP_SCENE_CHANGE_DELAY_MIN,
+            PROP_SCENE_CHANGE_DELAY_MAX,
+            PROP_SCENE_CHANGE_DELAY_STEP
+        );
+        obs_property_float_set_suffix(property, "s");
+        obs_property_set_visible(property, false);  // hidden until Fixed Camera is selected
+
         // Independent crop toggle
         property = obs_properties_add_bool(
             properties,
@@ -253,9 +271,28 @@ namespace lvk
     bool VSFilter::on_motion_profile_changed(obs_properties_t* props, obs_property_t* /*property*/, obs_data_t* settings)
     {
         const std::string profile = obs_data_get_string(settings, PROP_MOTION_PROFILE);
-        auto* snap_prop = obs_properties_get(props, PROP_ANCHOR_SNAP_THRESHOLD);
-        obs_property_set_visible(snap_prop, profile == PROP_MOTION_PROFILE_FIXED);
+        const bool fixed = (profile == PROP_MOTION_PROFILE_FIXED);
+        obs_property_set_visible(obs_properties_get(props, PROP_ANCHOR_SNAP_THRESHOLD), fixed);
+        obs_property_set_visible(obs_properties_get(props, PROP_SCENE_CHANGE_DELAY),    fixed);
         return true;
+    }
+
+//---------------------------------------------------------------------------------------------------------------------
+
+    void VSFilter::on_source_activate(void* data, calldata_t* /*cd*/)
+    {
+        auto* self = static_cast<VSFilter*>(data);
+
+        // Only engage the cooldown when anchor mode is active.
+        if(!self->m_Filter.settings().anchor_mode)
+            return;
+
+        // Load the pre-computed frame count (written by configure() on the
+        // main thread; this callback also runs on the main thread).
+        self->m_SceneChangeCooldown.store(
+            self->m_SceneChangeDelayFrames,
+            std::memory_order_relaxed
+        );
     }
 
 //---------------------------------------------------------------------------------------------------------------------
@@ -276,6 +313,7 @@ namespace lvk
         obs_data_set_default_bool(settings, PROP_APPLY_CROP, PROP_APPLY_CROP_DEFAULT);
 		obs_data_set_default_bool(settings, PROP_TEST_MODE, PROP_TEST_MODE_DEFAULT);
         obs_data_set_default_double(settings, PROP_ANCHOR_SNAP_THRESHOLD, PROP_ANCHOR_SNAP_THRESHOLD_DEFAULT);
+        obs_data_set_default_double(settings, PROP_SCENE_CHANGE_DELAY,    PROP_SCENE_CHANGE_DELAY_DEFAULT);
 	}
 
 //---------------------------------------------------------------------------------------------------------------------
@@ -381,6 +419,10 @@ namespace lvk
         obs_get_video_info(&video_info);
         const float video_fps = static_cast<float>(video_info.fps_num) / static_cast<float>(video_info.fps_den);
 
+        // Pre-compute the scene-change cooldown duration in frames.
+        const float delay_secs = static_cast<float>(obs_data_get_double(settings, PROP_SCENE_CHANGE_DELAY));
+        m_SceneChangeDelayFrames = static_cast<uint32_t>(delay_secs * video_fps);
+
 		// Update the frame delay indicator for the user
 		const auto old_stream_delay = obs_data_get_int(settings, PROP_STREAM_DELAY_INFO);
 		const auto new_stream_delay = static_cast<int>(
@@ -436,10 +478,12 @@ namespace lvk
             "lvk_stabilizer_ptz_hold",
             "Stabilizer: Hold During PTZ Move",
             [](void* data, obs_hotkey_id, obs_hotkey_t*, bool pressed) {
-                static_cast<VSFilter*>(data)->m_Filter.set_ptz_active(pressed);
+                static_cast<VSFilter*>(data)->m_HotkeyPtzActive.store(pressed, std::memory_order_relaxed);
             },
             this
         );
+        // Note: the source "activate" signal is connected lazily on the first
+        // filter() call, once obs_filter_get_parent() returns a valid pointer.
     }
 
 //---------------------------------------------------------------------------------------------------------------------
@@ -448,6 +492,18 @@ namespace lvk
     {
         if(m_PtzHotkeyId != OBS_INVALID_HOTKEY_ID)
             obs_hotkey_unregister(m_PtzHotkeyId);
+
+        if(m_SignalConnected)
+        {
+            auto* parent = obs_filter_get_parent(m_Context);
+            if(parent)
+                signal_handler_disconnect(
+                    obs_source_get_signal_handler(parent),
+                    "activate",
+                    VSFilter::on_source_activate,
+                    this
+                );
+        }
     }
 
 //---------------------------------------------------------------------------------------------------------------------
@@ -455,6 +511,37 @@ namespace lvk
 	void VSFilter::filter(OBSFrame& frame)
 	{
         LVK_PROFILE;
+
+        // Lazily connect to the parent source's "activate" signal the first time
+        // filter() is called — this is the earliest point obs_filter_get_parent()
+        // is guaranteed to return a valid pointer.
+        if(!m_SignalConnected)
+        {
+            auto* parent = obs_filter_get_parent(m_Context);
+            if(parent)
+            {
+                signal_handler_connect(
+                    obs_source_get_signal_handler(parent),
+                    "activate",
+                    VSFilter::on_source_activate,
+                    this
+                );
+                m_SignalConnected = true;
+            }
+        }
+
+        // Combine the manual hotkey and the scene-change cooldown into one
+        // PTZ override signal.  The cooldown is decremented each frame so it
+        // naturally expires after the configured delay with no timer needed.
+        {
+            const uint32_t cooldown = m_SceneChangeCooldown.load(std::memory_order_relaxed);
+            if(cooldown > 0)
+                m_SceneChangeCooldown.fetch_sub(1, std::memory_order_relaxed);
+
+            m_Filter.set_ptz_active(
+                m_HotkeyPtzActive.load(std::memory_order_relaxed) || (cooldown > 0)
+            );
+        }
 
         if(m_TestMode)
         {

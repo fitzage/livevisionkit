@@ -17,6 +17,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <LiveVisionKit.hpp>
 
 #include "Interop/VisionFilter.hpp"
@@ -52,13 +53,22 @@ namespace lvk
 
         static bool on_delay_update(void* data, obs_properties_t* props, obs_property_t* property, obs_data_t* settings);
 
+        // Fires on the main thread when the filter's parent source becomes visible
+        // in the current scene.  Starts the scene-change PTZ cooldown.
+        static void on_source_activate(void* data, calldata_t* cd);
+
 	private:
 		obs_source_t* m_Context = nullptr;
 
 		StabilizationFilter m_Filter;
 		bool m_TestMode = false;
 
-        obs_hotkey_id m_PtzHotkeyId = OBS_INVALID_HOTKEY_ID;
+        // PTZ override sources — combined in filter() each frame
+        obs_hotkey_id          m_PtzHotkeyId         = OBS_INVALID_HOTKEY_ID;
+        std::atomic<bool>      m_HotkeyPtzActive{false};
+        std::atomic<uint32_t>  m_SceneChangeCooldown{0};  // frames remaining
+        uint32_t               m_SceneChangeDelayFrames = 0;
+        bool                   m_SignalConnected = false;
 	};
 
 }
