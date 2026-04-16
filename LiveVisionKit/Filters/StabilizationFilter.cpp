@@ -136,6 +136,13 @@ namespace lvk
 
 //---------------------------------------------------------------------------------------------------------------------
 
+    void StabilizationFilter::set_ptz_active(bool active) noexcept
+    {
+        m_PathSmoother.set_ptz_active(active);
+    }
+
+//---------------------------------------------------------------------------------------------------------------------
+
 	void StabilizationFilter::restart()
 	{
         m_SceneQuality = 1.0f;

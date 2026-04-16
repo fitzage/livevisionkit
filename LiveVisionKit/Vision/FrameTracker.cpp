@@ -343,8 +343,11 @@ namespace lvk
         params.loMethod = cv::LOCAL_OPTIM_SIGMA;
         params.loIterations = 10;
         params.loSampleSize = 20;
+        // final_polisher was added in OpenCV 4.7.0; Ubuntu 22.04 ships 4.5.4
+#if CV_VERSION_MAJOR > 4 || (CV_VERSION_MAJOR == 4 && CV_VERSION_MINOR >= 7)
         params.final_polisher = cv::MAGSAC;
         params.final_polisher_iterations = 0;
+#endif
 
         if(homography)
         {

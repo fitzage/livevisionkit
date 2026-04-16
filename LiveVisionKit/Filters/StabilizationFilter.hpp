@@ -49,6 +49,9 @@ namespace lvk
 
 		void restart();
 
+        // Forward PTZ move state to the path smoother.  Safe to call from any thread.
+        void set_ptz_active(bool active) noexcept;
+
         bool ready() const;
 
 		void reset_context();

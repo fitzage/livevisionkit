@@ -17,6 +17,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <opencv2/opencv.hpp>
 
 #include "Math/WarpMesh.hpp"
@@ -36,6 +37,28 @@ namespace lvk
         // Smoothing Characteristics
         float smoothing_steps = 20.0f;
         float response_rate = 0.04f;
+        float release_rate = 0.04f;
+
+        // Anchor mode: zero-latency EMA anchor suited for fixed/PTZ cameras.
+        // All motion is treated as vibration and corrected back to a slowly-
+        // drifting anchor point.  anchor_decay controls how fast the anchor
+        // follows sustained (intentional) camera moves: lower = more stable
+        // but slower to accept a deliberate PTZ repositioning.
+        // anchor_snap_threshold: per-frame motion magnitude (as a fraction of
+        // frame size) that distinguishes vibration from intentional camera
+        // movement.  A door slam is an impulse that may briefly exceed this;
+        // a deliberate pan sustains it for many consecutive frames.
+        //
+        // anchor_ptz_hold_frames: how many consecutive frames must exceed
+        // anchor_snap_threshold before the stabilizer decides the motion is
+        // intentional and snaps the anchor.  Also how many consecutive quiet
+        // frames are needed to re-enter stabilization (symmetric hysteresis).
+        // Higher values reduce false PTZ triggers from vibration impulses but
+        // add a small detection lag at the start of a pan.
+        bool   anchor_mode            = false;
+        float  anchor_decay           = 0.003f;
+        float  anchor_snap_threshold  = 0.010f;
+        size_t anchor_ptz_hold_frames = 5;
     };
 
     class PathSmoother final : public Configurable<PathSmootherSettings>
@@ -48,6 +71,12 @@ namespace lvk
 
         WarpMesh next(const WarpMesh& motion);
 
+        // Signal that a deliberate PTZ move is in progress.  While active the
+        // anchor snaps to the current position every frame, so no correction is
+        // applied and the stabilizer does not fight the intentional reframe.
+        // Safe to call from any thread (hotkey / UI thread).
+        void set_ptz_active(bool active) noexcept;
+
         void restart();
 
         size_t time_delay() const;
@@ -57,11 +86,15 @@ namespace lvk
         const cv::Rect2f& scene_margins() const;
 
     private:
+        std::atomic<bool> m_PtzActive{false};
+        size_t m_PanFrameCount = 0;
+
         double m_SmoothingFactor = 0.0f;
         double m_BaseSmoothingFactor = 0.0f;
         StreamBuffer<WarpMesh> m_Trajectory{1};
         WarpMesh m_Trace{WarpMesh::MinimumSize};
         WarpMesh m_Position{WarpMesh::MinimumSize};
+        WarpMesh m_Anchor{WarpMesh::MinimumSize};
 
         cv::Rect2f m_SceneMargins{0,0,0,0};
         WarpMesh m_SceneCrop{WarpMesh::MinimumSize};

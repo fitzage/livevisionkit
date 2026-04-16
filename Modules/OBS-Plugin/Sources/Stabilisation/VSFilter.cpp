@@ -28,9 +28,38 @@ namespace lvk
 
 	constexpr auto PROP_PREDICTIVE_SAMPLES = "SMOOTH_RADIUS";
 	constexpr auto PROP_PREDICTIVE_SAMPLES_DEFAULT = "10";
-    constexpr std::array<const char*,7> PROP_PREDICTIVE_SAMPLES_OPTIONS = {
-        "5", "10", "15", "20", "30", "40", "60"
+    constexpr std::array<const char*,8> PROP_PREDICTIVE_SAMPLES_OPTIONS = {
+        "3", "5", "10", "15", "20", "30", "40", "60"
     };
+
+    constexpr auto PROP_MOTION_PROFILE = "MOTION_PROFILE";
+    constexpr auto PROP_MOTION_PROFILE_TRANSIENT = "MP_TRANSIENT";
+    constexpr auto PROP_MOTION_PROFILE_CONTINUOUS = "MP_CONTINUOUS";
+    constexpr auto PROP_MOTION_PROFILE_FIXED = "MP_FIXED";
+    constexpr auto PROP_MOTION_PROFILE_DEFAULT = PROP_MOTION_PROFILE_TRANSIENT;
+
+    // Transient: fast release avoids prolonged correction after a momentary bump
+    constexpr float MOTION_PROFILE_TRANSIENT_RESPONSE_RATE = 0.15f;
+    constexpr float MOTION_PROFILE_TRANSIENT_RELEASE_RATE  = 0.40f;
+    // Continuous: original slow rates, designed for sustained/ongoing hand-shake
+    constexpr float MOTION_PROFILE_CONTINUOUS_RESPONSE_RATE = 0.04f;
+    constexpr float MOTION_PROFILE_CONTINUOUS_RELEASE_RATE  = 0.04f;
+    // Fixed Camera: EMA anchor — zero latency, treats all motion as vibration.
+    // anchor_decay controls how fast the anchor accepts intentional PTZ moves.
+    // 0.003/frame ≈ 11-second time constant at 30 fps.
+    constexpr float MOTION_PROFILE_FIXED_ANCHOR_DECAY = 0.003f;
+
+    constexpr auto  PROP_ANCHOR_SNAP_THRESHOLD         = "ANCHOR_SNAP_THRESHOLD";
+    constexpr float PROP_ANCHOR_SNAP_THRESHOLD_DEFAULT = 1.0f;   // percent of frame size
+    constexpr float PROP_ANCHOR_SNAP_THRESHOLD_MIN     = 0.1f;
+    constexpr float PROP_ANCHOR_SNAP_THRESHOLD_MAX     = 5.0f;
+    constexpr float PROP_ANCHOR_SNAP_THRESHOLD_STEP    = 0.1f;
+
+    constexpr auto  PROP_SCENE_CHANGE_DELAY         = "SCENE_CHANGE_DELAY";
+    constexpr float PROP_SCENE_CHANGE_DELAY_DEFAULT = 5.0f;   // seconds
+    constexpr float PROP_SCENE_CHANGE_DELAY_MIN     = 0.0f;
+    constexpr float PROP_SCENE_CHANGE_DELAY_MAX     = 30.0f;
+    constexpr float PROP_SCENE_CHANGE_DELAY_STEP    = 0.5f;
 
 	constexpr auto PROP_STREAM_DELAY_INFO = "STREAM_DELAY_INFO";
 	constexpr auto PROP_STREAM_DELAY_INFO_MAX = 60000;
@@ -121,6 +150,42 @@ namespace lvk
         obs_property_list_add_string(property, L("vs.qa.relaxed"), PROP_QUALITY_ASSURANCE_RELAXED);
         obs_property_list_add_string(property, L("vs.qa.strict"), PROP_QUALITY_ASSURANCE_STRICT);
 
+        // Motion Profile
+        property = obs_properties_add_list(
+            properties,
+            PROP_MOTION_PROFILE,
+            L("vs.motion-profile"),
+            OBS_COMBO_TYPE_LIST,
+            OBS_COMBO_FORMAT_STRING
+        );
+        obs_property_list_add_string(property, L("vs.motion-profile.transient"),  PROP_MOTION_PROFILE_TRANSIENT);
+        obs_property_list_add_string(property, L("vs.motion-profile.continuous"), PROP_MOTION_PROFILE_CONTINUOUS);
+        obs_property_list_add_string(property, L("vs.motion-profile.fixed"),      PROP_MOTION_PROFILE_FIXED);
+        obs_property_set_modified_callback(property, VSFilter::on_motion_profile_changed);
+
+        // PTZ Move Threshold (visible only for Fixed Camera profile)
+        property = obs_properties_add_float_slider(
+            properties,
+            PROP_ANCHOR_SNAP_THRESHOLD,
+            L("vs.ptz-threshold"),
+            PROP_ANCHOR_SNAP_THRESHOLD_MIN,
+            PROP_ANCHOR_SNAP_THRESHOLD_MAX,
+            PROP_ANCHOR_SNAP_THRESHOLD_STEP
+        );
+        obs_property_float_set_suffix(property, "%");
+        obs_property_set_visible(property, false);  // hidden until Fixed Camera is selected
+
+        // Scene Change Delay (visible only for Fixed Camera profile)
+        property = obs_properties_add_float_slider(
+            properties,
+            PROP_SCENE_CHANGE_DELAY,
+            L("vs.scene-delay"),
+            PROP_SCENE_CHANGE_DELAY_MIN,
+            PROP_SCENE_CHANGE_DELAY_MAX,
+            PROP_SCENE_CHANGE_DELAY_STEP
+        );
+        obs_property_float_set_suffix(property, "s");
+        obs_property_set_visible(property, false);  // hidden until Fixed Camera is selected
 
         // Independent crop toggle
         property = obs_properties_add_bool(
@@ -203,12 +268,42 @@ namespace lvk
 
 //---------------------------------------------------------------------------------------------------------------------
 
+    bool VSFilter::on_motion_profile_changed(obs_properties_t* props, obs_property_t* /*property*/, obs_data_t* settings)
+    {
+        const std::string profile = obs_data_get_string(settings, PROP_MOTION_PROFILE);
+        const bool fixed = (profile == PROP_MOTION_PROFILE_FIXED);
+        obs_property_set_visible(obs_properties_get(props, PROP_ANCHOR_SNAP_THRESHOLD), fixed);
+        obs_property_set_visible(obs_properties_get(props, PROP_SCENE_CHANGE_DELAY),    fixed);
+        return true;
+    }
+
+//---------------------------------------------------------------------------------------------------------------------
+
+    void VSFilter::on_source_activate(void* data, calldata_t* /*cd*/)
+    {
+        auto* self = static_cast<VSFilter*>(data);
+
+        // Only engage the cooldown when anchor mode is active.
+        if(!self->m_Filter.settings().anchor_mode)
+            return;
+
+        // Load the pre-computed frame count (written by configure() on the
+        // main thread; this callback also runs on the main thread).
+        self->m_SceneChangeCooldown.store(
+            self->m_SceneChangeDelayFrames,
+            std::memory_order_relaxed
+        );
+    }
+
+//---------------------------------------------------------------------------------------------------------------------
+
 	void VSFilter::LoadDefaults(obs_data_t* settings)
 	{
 		LVK_ASSERT(settings != nullptr);
 
-        obs_data_set_default_string(settings,PROP_PREDICTIVE_SAMPLES, PROP_PREDICTIVE_SAMPLES_DEFAULT);
+        obs_data_set_default_string(settings, PROP_PREDICTIVE_SAMPLES, PROP_PREDICTIVE_SAMPLES_DEFAULT);
         obs_data_set_default_string(settings, PROP_QUALITY_ASSURANCE, PROP_QUALITY_ASSURANCE_DEFAULT);
+        obs_data_set_default_string(settings, PROP_MOTION_PROFILE, PROP_MOTION_PROFILE_DEFAULT);
 		obs_data_set_default_int(settings, PROP_BACKGROUND_COLOUR, PROP_BACKGROUND_COLOUR_DEFAULT);
         obs_data_set_default_double(settings, PROP_CROP_PERCENTAGE_X, PROP_CROP_PERCENTAGE_DEFAULT);
         obs_data_set_default_double(settings, PROP_CROP_PERCENTAGE_Y, PROP_CROP_PERCENTAGE_DEFAULT);
@@ -217,6 +312,8 @@ namespace lvk
         obs_data_set_default_string(settings, PROP_SUBSYSTEM, PROP_SUBSYSTEM_DEFAULT);
         obs_data_set_default_bool(settings, PROP_APPLY_CROP, PROP_APPLY_CROP_DEFAULT);
 		obs_data_set_default_bool(settings, PROP_TEST_MODE, PROP_TEST_MODE_DEFAULT);
+        obs_data_set_default_double(settings, PROP_ANCHOR_SNAP_THRESHOLD, PROP_ANCHOR_SNAP_THRESHOLD_DEFAULT);
+        obs_data_set_default_double(settings, PROP_SCENE_CHANGE_DELAY,    PROP_SCENE_CHANGE_DELAY_DEFAULT);
 	}
 
 //---------------------------------------------------------------------------------------------------------------------
@@ -291,12 +388,40 @@ namespace lvk
                 stab_settings.min_scene_quality = 0.40f;
                 stab_settings.min_tracking_quality = 0.20f;
             }
+
+            // Configure motion profile (controls correction strategy)
+            const std::string motion_profile = obs_data_get_string(settings, PROP_MOTION_PROFILE);
+            if(motion_profile == PROP_MOTION_PROFILE_FIXED)
+            {
+                stab_settings.anchor_mode           = true;
+                stab_settings.anchor_decay          = MOTION_PROFILE_FIXED_ANCHOR_DECAY;
+                stab_settings.anchor_snap_threshold =
+                    static_cast<float>(obs_data_get_double(settings, PROP_ANCHOR_SNAP_THRESHOLD)) * 0.01f;
+            }
+            else
+            {
+                stab_settings.anchor_mode = false;
+                if(motion_profile == PROP_MOTION_PROFILE_CONTINUOUS)
+                {
+                    stab_settings.response_rate = MOTION_PROFILE_CONTINUOUS_RESPONSE_RATE;
+                    stab_settings.release_rate  = MOTION_PROFILE_CONTINUOUS_RELEASE_RATE;
+                }
+                else // Transient (default)
+                {
+                    stab_settings.response_rate = MOTION_PROFILE_TRANSIENT_RESPONSE_RATE;
+                    stab_settings.release_rate  = MOTION_PROFILE_TRANSIENT_RELEASE_RATE;
+                }
+            }
 		});
 
         // Get FPS info for the stream.
         obs_video_info video_info = {};
         obs_get_video_info(&video_info);
         const float video_fps = static_cast<float>(video_info.fps_num) / static_cast<float>(video_info.fps_den);
+
+        // Pre-compute the scene-change cooldown duration in frames.
+        const float delay_secs = static_cast<float>(obs_data_get_double(settings, PROP_SCENE_CHANGE_DELAY));
+        m_SceneChangeDelayFrames = static_cast<uint32_t>(delay_secs * video_fps);
 
 		// Update the frame delay indicator for the user
 		const auto old_stream_delay = obs_data_get_int(settings, PROP_STREAM_DELAY_INFO);
@@ -345,6 +470,40 @@ namespace lvk
 		LVK_ASSERT(context != nullptr);
 
         m_Filter.set_timing_samples(TIMING_SAMPLES);
+
+        // Register a hold-style hotkey: while held the anchor snaps every frame so
+        // the stabilizer does not fight deliberate PTZ pans or zooms.
+        m_PtzHotkeyId = obs_hotkey_register_source(
+            context,
+            "lvk_stabilizer_ptz_hold",
+            "Stabilizer: Hold During PTZ Move",
+            [](void* data, obs_hotkey_id, obs_hotkey_t*, bool pressed) {
+                static_cast<VSFilter*>(data)->m_HotkeyPtzActive.store(pressed, std::memory_order_relaxed);
+            },
+            this
+        );
+        // Note: the source "activate" signal is connected lazily on the first
+        // filter() call, once obs_filter_get_parent() returns a valid pointer.
+    }
+
+//---------------------------------------------------------------------------------------------------------------------
+
+    VSFilter::~VSFilter()
+    {
+        if(m_PtzHotkeyId != OBS_INVALID_HOTKEY_ID)
+            obs_hotkey_unregister(m_PtzHotkeyId);
+
+        if(m_SignalConnected)
+        {
+            auto* parent = obs_filter_get_parent(m_Context);
+            if(parent)
+                signal_handler_disconnect(
+                    obs_source_get_signal_handler(parent),
+                    "activate",
+                    VSFilter::on_source_activate,
+                    this
+                );
+        }
     }
 
 //---------------------------------------------------------------------------------------------------------------------
@@ -352,6 +511,37 @@ namespace lvk
 	void VSFilter::filter(OBSFrame& frame)
 	{
         LVK_PROFILE;
+
+        // Lazily connect to the parent source's "activate" signal the first time
+        // filter() is called — this is the earliest point obs_filter_get_parent()
+        // is guaranteed to return a valid pointer.
+        if(!m_SignalConnected)
+        {
+            auto* parent = obs_filter_get_parent(m_Context);
+            if(parent)
+            {
+                signal_handler_connect(
+                    obs_source_get_signal_handler(parent),
+                    "activate",
+                    VSFilter::on_source_activate,
+                    this
+                );
+                m_SignalConnected = true;
+            }
+        }
+
+        // Combine the manual hotkey and the scene-change cooldown into one
+        // PTZ override signal.  The cooldown is decremented each frame so it
+        // naturally expires after the configured delay with no timer needed.
+        {
+            const uint32_t cooldown = m_SceneChangeCooldown.load(std::memory_order_relaxed);
+            if(cooldown > 0)
+                m_SceneChangeCooldown.fetch_sub(1, std::memory_order_relaxed);
+
+            m_Filter.set_ptz_active(
+                m_HotkeyPtzActive.load(std::memory_order_relaxed) || (cooldown > 0)
+            );
+        }
 
         if(m_TestMode)
         {

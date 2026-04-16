@@ -1,0 +1,271 @@
+name: Build OBS Plugin
+
+on:
+  push:
+    branches: ['**']
+  workflow_dispatch:
+
+env:
+  OBS_VERSION:    "30.1.2"
+  OPENCV_VERSION: "4.10.0"
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+# ============================================================================
+jobs:
+
+  # --------------------------------------------------------------------------
+  # Windows x64
+  # --------------------------------------------------------------------------
+  build-windows:
+    name: Windows x64
+    runs-on: windows-2022
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # MSVC tools (dumpbin, lib) must be in PATH for the OBS SDK step
+      - name: Set up MSVC x64
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      # ── OpenCV pre-built Windows binary ────────────────────────────────────
+      - name: Cache OpenCV
+        id: cache-opencv
+        uses: actions/cache@v4
+        with:
+          path: deps/opencv
+          key: opencv-${{ env.OPENCV_VERSION }}-win64
+
+      - name: Download & extract OpenCV
+        if: steps.cache-opencv.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          $url = "https://github.com/opencv/opencv/releases/download/${{ env.OPENCV_VERSION }}/opencv-${{ env.OPENCV_VERSION }}-windows.exe"
+          Invoke-WebRequest $url -OutFile opencv.exe
+          # The SFX extracts an "opencv/" directory into the target folder
+          & 7z x opencv.exe -o"deps" -y | Out-Null
+
+      # ── Eigen3 (header-only, cmake install) ────────────────────────────────
+      - name: Cache Eigen3
+        id: cache-eigen
+        uses: actions/cache@v4
+        with:
+          path: deps/eigen
+          key: eigen-3.4.0
+
+      - name: Install Eigen3
+        if: steps.cache-eigen.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          git clone --depth 1 --branch 3.4.0 `
+            https://gitlab.com/libeigen/eigen.git deps/eigen-src
+          cmake -B deps/eigen-build -S deps/eigen-src `
+            "-DCMAKE_INSTALL_PREFIX=${{ github.workspace }}\deps\eigen"
+          cmake --install deps/eigen-build
+
+      # ── OBS SDK: headers from source + obs.lib generated from release DLL ──
+      #
+      # We avoid a full OBS source build (which needs its own bundled deps).
+      # Instead:
+      #   1. Clone OBS at the pinned tag  →  copy libobs/*.h as headers
+      #   2. Download the OBS portable release  →  get obs.dll
+      #   3. Use dumpbin + lib.exe (MSVC)  →  generate obs.lib
+      #
+      # The resulting tree matches what LVK's CMakeLists.txt expects:
+      #   deps/obs-sdk/install/include/   ← obs.h, obs-module.h, …
+      #   deps/obs-sdk/install/bin/64bit/ ← obs.lib
+      # ───────────────────────────────────────────────────────────────────────
+      - name: Cache OBS SDK
+        id: cache-obs
+        uses: actions/cache@v4
+        with:
+          path: deps/obs-sdk
+          key: obs-sdk-${{ env.OBS_VERSION }}-win64-v2
+
+      - name: Build OBS SDK (headers + import lib)
+        if: steps.cache-obs.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          # ── Headers ──
+          git clone --depth 1 --branch ${{ env.OBS_VERSION }} `
+            https://github.com/obsproject/obs-studio.git deps/obs-src
+
+          $incDir = "deps\obs-sdk\install\include"
+          $binDir = "deps\obs-sdk\install\bin\64bit"
+          New-Item -ItemType Directory -Force -Path $incDir | Out-Null
+          New-Item -ItemType Directory -Force -Path $binDir | Out-Null
+
+          # Copy all of libobs/ recursively (obs.h, obs-module.h, util/, graphics/, media-io/, …)
+          # obs.h uses relative includes like "util/c99defs.h" so subdirs must be present
+          Copy-Item -Path "deps\obs-src\libobs\*" -Destination $incDir -Recurse -Force
+
+          # ── obs.dll → obs.lib ──
+          # Use the GitHub API to find the exact portable-zip asset name,
+          # so we never hardcode a filename that might not exist for a given tag.
+          $headers = @{
+            'Accept'        = 'application/vnd.github.v3+json'
+            'Authorization' = "Bearer ${{ github.token }}"
+          }
+          $apiUrl  = "https://api.github.com/repos/obsproject/obs-studio/releases/tags/${{ env.OBS_VERSION }}"
+          $release = Invoke-RestMethod $apiUrl -Headers $headers
+          $zipAsset = $release.assets |
+            Where-Object {
+              $_.name -like "OBS-Studio-*.zip" -and
+              $_.name -notlike "*macOS*" -and
+              $_.name -notlike "*Ubuntu*" -and
+              $_.name -notlike "*pdbs*" -and
+              $_.name -notlike "*dSYM*"
+            } |
+            Select-Object -First 1
+
+          if (-not $zipAsset) {
+            $names = ($release.assets | ForEach-Object { $_.name }) -join ', '
+            throw "No Windows zip asset found. Available: $names"
+          }
+          Write-Host "Downloading: $($zipAsset.name)"
+          Invoke-WebRequest $zipAsset.browser_download_url -OutFile obs-release.zip
+          Expand-Archive obs-release.zip -DestinationPath "deps\obs-release"
+
+          $obsDll = Get-ChildItem -Recurse "deps\obs-release" -Filter "obs.dll" |
+            Where-Object { $_.DirectoryName -like "*64bit*" } |
+            Select-Object -First 1 -ExpandProperty FullName
+
+          if (-not $obsDll) { throw "obs.dll not found in release archive" }
+          Write-Host "Found obs.dll: $obsDll"
+
+          # Use Python (more reliable than PowerShell regex on dumpbin output)
+          # Script lives in .github/scripts/ to avoid YAML/here-string conflicts.
+          $defPath = "$binDir\obs.def"
+          python .github/scripts/gen_obs_def.py "$obsDll" "$defPath"
+          if ($LASTEXITCODE -ne 0) { throw "DEF generation failed" }
+
+          # Generate import library
+          $libPath = "$binDir\obs.lib"
+          & lib /DEF:$defPath /OUT:$libPath /MACHINE:X64
+          if ($LASTEXITCODE -ne 0) { throw "lib.exe failed" }
+          Write-Host "Generated $libPath"
+
+      # ── Configure & build LVK ─────────────────────────────────────────────
+      - name: Configure
+        shell: pwsh
+        run: |
+          # Auto-discover OpenCV: find the root OpenCVConfig.cmake
+          # (the one directly under build/, not inside build/x64/vc*/lib/)
+          $cvConfig = Get-ChildItem -Recurse deps -Filter "OpenCVConfig.cmake" |
+            Where-Object {
+              $_.FullName -notlike "*sources*" -and
+              $_.FullName -notlike "*\vc1*\*"
+            } |
+            Sort-Object { $_.FullName.Length } |
+            Select-Object -First 1
+
+          if (-not $cvConfig) {
+            Write-Host "ERROR: OpenCVConfig.cmake not found. deps/ contents:"
+            Get-ChildItem -Recurse deps | Select-Object -ExpandProperty FullName
+            throw "OpenCVConfig.cmake not found in deps/"
+          }
+          $cvPath = $cvConfig.DirectoryName
+          Write-Host "OpenCV cmake config : $cvPath"
+          Write-Host "Eigen  install root : ${{ github.workspace }}\deps\eigen"
+          Write-Host "OBS    SDK root     : ${{ github.workspace }}\deps\obs-sdk"
+
+          # Verify OBS SDK files exist before running cmake
+          $obsInc = "${{ github.workspace }}\deps\obs-sdk\install\include"
+          $obsLib = "${{ github.workspace }}\deps\obs-sdk\install\bin\64bit\obs.lib"
+          if (-not (Test-Path $obsInc)) { throw "OBS include dir missing: $obsInc" }
+          if (-not (Test-Path $obsLib)) { throw "OBS import lib missing: $obsLib" }
+
+          cmake -B build `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DBUILD_VIDEO_EDITOR=OFF `
+            "-DOPENCV_BUILD_PATH=$cvPath" `
+            "-DEIGEN_BUILD_PATH=${{ github.workspace }}\deps\eigen" `
+            "-DOBS_BUILD_PATH=${{ github.workspace }}\deps\obs-sdk"
+
+      - name: Build
+        run: cmake --build build --config Release -j4
+
+      - name: Install
+        run: cmake --install build --config Release
+
+      # Bundle the OpenCV world DLL so users can drag-and-drop the artifact
+      # folder onto their OBS installation without installing OpenCV separately.
+      - name: Bundle OpenCV runtime DLL
+        shell: pwsh
+        run: |
+          $cvDll = Get-ChildItem -Recurse deps/opencv -Filter "opencv_world*.dll" |
+            Where-Object { $_.FullName -like "*\x64\*" -and $_.FullName -notlike "*d.dll" } |
+            Select-Object -First 1
+          if (-not $cvDll) { throw "opencv_world DLL not found" }
+          Write-Host "Bundling: $($cvDll.FullName)"
+          $dest = Get-ChildItem -Recurse "build/Install" -Filter "lvk-obs.dll" |
+            Select-Object -First 1 -ExpandProperty DirectoryName
+          Copy-Item $cvDll.FullName $dest
+
+      # Artifact layout mirrors OBS's plugin folder structure so users can
+      # drag-and-drop it onto their OBS installation directory.
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: LiveVisionKit-Windows-x64
+          path: build/Install/Releases/
+
+  # --------------------------------------------------------------------------
+  # Linux x64
+  # --------------------------------------------------------------------------
+  build-linux:
+    name: Linux x64
+    runs-on: ubuntu-22.04
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # Use the official OBS PPA — gives us pre-built libobs headers & .so,
+      # avoiding a from-source OBS build in CI entirely.
+      - name: Add OBS PPA & install system dependencies
+        run: |
+          sudo add-apt-repository ppa:obsproject/obs-studio -y
+          sudo apt-get update -qq
+          sudo apt-get install -y \
+            cmake g++ \
+            libopencv-dev libeigen3-dev qtbase5-dev libqt5opengl5-dev \
+            libobs-dev
+
+      # Arrange system OBS files into the directory tree LVK CMakeLists expects:
+      #   fake-obs/install/include/obs/   ← headers (from /usr/include/obs/)
+      #   fake-obs/install/lib/           ← libobs.so
+      - name: Create OBS SDK layout
+        run: |
+          mkdir -p fake-obs/install/include
+          mkdir -p fake-obs/install/lib
+
+          cp -r /usr/include/obs fake-obs/install/include/
+
+          OBS_SO=$(find /usr/lib -name "libobs.so" 2>/dev/null | head -1)
+          if [ -z "$OBS_SO" ]; then
+            OBS_SO=$(find /usr/lib -name "libobs.so.*" 2>/dev/null | head -1)
+          fi
+          echo "Using libobs: $OBS_SO"
+          cp "$OBS_SO" fake-obs/install/lib/libobs.so
+
+      - name: Configure
+        run: |
+          cmake -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_VIDEO_EDITOR=OFF \
+            -DOPENCV_BUILD_PATH=/usr/lib/x86_64-linux-gnu/cmake/opencv4 \
+            -DEIGEN_BUILD_PATH=/usr/share/eigen3/cmake \
+            -DOBS_BUILD_PATH=$(pwd)/fake-obs
+
+      - name: Build
+        run: cmake --build build -j$(nproc)
+
+      - name: Install
+        run: cmake --install build
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: LiveVisionKit-Linux-x64
+          path: build/Install/Releases/

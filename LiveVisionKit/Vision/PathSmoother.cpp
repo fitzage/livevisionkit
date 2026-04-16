@@ -42,6 +42,14 @@ namespace lvk
         LVK_ASSERT(settings.predictive_samples > 0);
         LVK_ASSERT(settings.smoothing_steps > 0.0f);
         LVK_ASSERT_01(settings.response_rate);
+        LVK_ASSERT_01(settings.release_rate);
+        LVK_ASSERT_01(settings.anchor_decay);
+        LVK_ASSERT(settings.anchor_snap_threshold > 0.0f);
+        LVK_ASSERT(settings.anchor_ptz_hold_frames > 0);
+
+        // Reset state when switching between anchor and path-smoothing modes.
+        if(m_Settings.anchor_mode != settings.anchor_mode)
+            restart();
 
         // Update motion resolution.
         if(m_Position.size() != settings.motion_resolution)
@@ -49,6 +57,7 @@ namespace lvk
             m_Trajectory.fill(settings.motion_resolution);
             m_Trace = WarpMesh(settings.motion_resolution);
             m_Position = WarpMesh(settings.motion_resolution);
+            m_Anchor = WarpMesh(settings.motion_resolution);
         }
 
         // Update trajectory sizing.
@@ -84,6 +93,55 @@ namespace lvk
     WarpMesh PathSmoother::next(const WarpMesh& motion)
     {
         LVK_ASSERT(motion.size() == m_Settings.motion_resolution);
+
+        // ── Anchor mode (fixed/PTZ camera) ───────────────────────────────────
+        // Zero latency.  Accumulates the camera path and maintains an EMA
+        // anchor.  Vibration (short-lived motion) is corrected back to the
+        // anchor.  Intentional PTZ moves (sustained large motion) cause the
+        // anchor to snap so the stabilizer stops fighting the deliberate
+        // reframe.
+        //
+        // Detection uses a saturating frame counter with symmetric hysteresis:
+        //   - counter increments each frame motion >= anchor_snap_threshold
+        //   - counter decrements each frame motion <  anchor_snap_threshold
+        //   - snap mode engaged when counter == anchor_ptz_hold_frames
+        //   - snap mode released when counter == 0
+        //
+        // A door slam is an impulse (1–3 large frames); the counter never
+        // reaches the hold threshold so it is treated as vibration.  A pan
+        // sustains large motion long enough to reach the threshold.
+        // m_PtzActive (hotkey override) bypasses the counter entirely.
+        if(m_Settings.anchor_mode)
+        {
+            m_Position += motion;
+
+            // Compute the per-frame motion magnitude (normalized to frame size).
+            float max_motion = 0.0f;
+            motion.read([&](const cv::Point2f& offset, const cv::Point& /*coord*/){
+                max_motion = std::max(max_motion, std::abs(offset.x));
+                max_motion = std::max(max_motion, std::abs(offset.y));
+            }, false);
+
+            // Update the saturating PTZ-detection counter.
+            if(max_motion >= m_Settings.anchor_snap_threshold)
+                m_PanFrameCount = std::min(m_PanFrameCount + 1, m_Settings.anchor_ptz_hold_frames);
+            else if(m_PanFrameCount > 0)
+                m_PanFrameCount--;
+
+            const bool snap = m_PtzActive.load(std::memory_order_relaxed)
+                           || (m_PanFrameCount >= m_Settings.anchor_ptz_hold_frames);
+            const float decay = snap ? 1.0f : m_Settings.anchor_decay;
+
+            auto drift = m_Position - m_Anchor;
+            drift *= decay;
+            m_Anchor += drift;
+
+            // Correction pushes the frame back toward the anchor.
+            auto correction = m_Anchor - m_Position;
+            correction.clamp(m_SceneMargins.tl());
+            return std::move(correction);
+        }
+        // ─────────────────────────────────────────────────────────────────────
 
         // Update the path's current state.
         m_Position -= m_Trajectory.oldest();
@@ -124,14 +182,25 @@ namespace lvk
             max_drift_error = 1.0f;
         }
 
-        // Adapt the smoothing factor to target a drift of 0.5.
+        // Adapt the smoothing factor to target a drift of 0.5, using separate rates for
+        // engaging correction (attack) and releasing it (release). A faster release_rate
+        // means the filter exits correction mode quickly once drift drops, which avoids
+        // the prolonged wobble seen after momentary/transient vibration events.
+        const double target_factor = hysteresis<double>(max_drift_error, 0.3, m_Settings.smoothing_steps, 0.7, 0.0);
         m_SmoothingFactor = exp_moving_average(
             m_SmoothingFactor,
-            hysteresis<double>(max_drift_error, 0.3, m_Settings.smoothing_steps, 0.7, 0.0),
-            m_Settings.response_rate
+            target_factor,
+            (target_factor > m_SmoothingFactor) ? m_Settings.release_rate : m_Settings.response_rate
         );
 
         return std::move(path_correction);
+    }
+
+//---------------------------------------------------------------------------------------------------------------------
+
+    void PathSmoother::set_ptz_active(bool active) noexcept
+    {
+        m_PtzActive.store(active, std::memory_order_relaxed);
     }
 
 //---------------------------------------------------------------------------------------------------------------------
@@ -142,13 +211,20 @@ namespace lvk
         for(auto& motion : m_Trajectory) motion.set_identity();
         m_Position.set_identity();
         m_Trace.set_identity();
+        m_Anchor.set_identity();
+        m_PanFrameCount = 0;
     }
 
 //---------------------------------------------------------------------------------------------------------------------
 
     size_t PathSmoother::time_delay() const
     {
-        return m_Settings.predictive_samples;
+        // Anchor mode needs at least 1 frame of delay to avoid a StreamBuffer
+        // capacity-1 bug: after skip() empties a size-1 queue, advance_window()
+        // sees StartIndex==EndIndex and never increments m_Size on subsequent
+        // pushes, so is_full() never becomes true (all output is black).
+        // Returning 1 gives queue capacity 2, which works correctly.
+        return m_Settings.anchor_mode ? 1 : m_Settings.predictive_samples;
     }
 
 //---------------------------------------------------------------------------------------------------------------------
