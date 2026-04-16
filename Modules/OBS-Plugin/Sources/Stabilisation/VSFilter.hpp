@@ -46,6 +46,8 @@ namespace lvk
 
         static bool on_crop_split(obs_properties_t* props, obs_property_t* property, obs_data_t* settings);
 
+        static bool on_motion_profile_changed(obs_properties_t* props, obs_property_t* property, obs_data_t* settings);
+
         static bool on_delay_update(void* data, obs_properties_t* props, obs_property_t* property, obs_data_t* settings);
 
 	private:

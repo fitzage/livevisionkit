@@ -43,8 +43,14 @@ namespace lvk
         // drifting anchor point.  anchor_decay controls how fast the anchor
         // follows sustained (intentional) camera moves: lower = more stable
         // but slower to accept a deliberate PTZ repositioning.
-        bool  anchor_mode  = false;
-        float anchor_decay = 0.003f;
+        // anchor_snap_threshold: if per-frame motion (as a fraction of frame
+        // size) exceeds this value, the anchor snaps to the current position
+        // immediately — treating the move as intentional PTZ rather than
+        // vibration.  Set lower to accept pans more eagerly; higher to
+        // require a larger motion before snapping.
+        bool  anchor_mode           = false;
+        float anchor_decay          = 0.003f;
+        float anchor_snap_threshold = 0.010f;
     };
 
     class PathSmoother final : public Configurable<PathSmootherSettings>

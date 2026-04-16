@@ -49,6 +49,12 @@ namespace lvk
     // 0.003/frame ≈ 11-second time constant at 30 fps.
     constexpr float MOTION_PROFILE_FIXED_ANCHOR_DECAY = 0.003f;
 
+    constexpr auto  PROP_ANCHOR_SNAP_THRESHOLD         = "ANCHOR_SNAP_THRESHOLD";
+    constexpr float PROP_ANCHOR_SNAP_THRESHOLD_DEFAULT = 1.0f;   // percent of frame size
+    constexpr float PROP_ANCHOR_SNAP_THRESHOLD_MIN     = 0.1f;
+    constexpr float PROP_ANCHOR_SNAP_THRESHOLD_MAX     = 5.0f;
+    constexpr float PROP_ANCHOR_SNAP_THRESHOLD_STEP    = 0.1f;
+
 	constexpr auto PROP_STREAM_DELAY_INFO = "STREAM_DELAY_INFO";
 	constexpr auto PROP_STREAM_DELAY_INFO_MAX = 60000;
 	constexpr auto PROP_STREAM_DELAY_INFO_MIN = 0;
@@ -149,7 +155,19 @@ namespace lvk
         obs_property_list_add_string(property, L("vs.motion-profile.transient"),  PROP_MOTION_PROFILE_TRANSIENT);
         obs_property_list_add_string(property, L("vs.motion-profile.continuous"), PROP_MOTION_PROFILE_CONTINUOUS);
         obs_property_list_add_string(property, L("vs.motion-profile.fixed"),      PROP_MOTION_PROFILE_FIXED);
+        obs_property_set_modified_callback(property, VSFilter::on_motion_profile_changed);
 
+        // PTZ Move Threshold (visible only for Fixed Camera profile)
+        property = obs_properties_add_float_slider(
+            properties,
+            PROP_ANCHOR_SNAP_THRESHOLD,
+            L("vs.ptz-threshold"),
+            PROP_ANCHOR_SNAP_THRESHOLD_MIN,
+            PROP_ANCHOR_SNAP_THRESHOLD_MAX,
+            PROP_ANCHOR_SNAP_THRESHOLD_STEP
+        );
+        obs_property_float_set_suffix(property, "%");
+        obs_property_set_visible(property, false);  // hidden until Fixed Camera is selected
 
         // Independent crop toggle
         property = obs_properties_add_bool(
@@ -232,6 +250,16 @@ namespace lvk
 
 //---------------------------------------------------------------------------------------------------------------------
 
+    bool VSFilter::on_motion_profile_changed(obs_properties_t* props, obs_property_t* /*property*/, obs_data_t* settings)
+    {
+        const std::string profile = obs_data_get_string(settings, PROP_MOTION_PROFILE);
+        auto* snap_prop = obs_properties_get(props, PROP_ANCHOR_SNAP_THRESHOLD);
+        obs_property_set_visible(snap_prop, profile == PROP_MOTION_PROFILE_FIXED);
+        return true;
+    }
+
+//---------------------------------------------------------------------------------------------------------------------
+
 	void VSFilter::LoadDefaults(obs_data_t* settings)
 	{
 		LVK_ASSERT(settings != nullptr);
@@ -247,6 +275,7 @@ namespace lvk
         obs_data_set_default_string(settings, PROP_SUBSYSTEM, PROP_SUBSYSTEM_DEFAULT);
         obs_data_set_default_bool(settings, PROP_APPLY_CROP, PROP_APPLY_CROP_DEFAULT);
 		obs_data_set_default_bool(settings, PROP_TEST_MODE, PROP_TEST_MODE_DEFAULT);
+        obs_data_set_default_double(settings, PROP_ANCHOR_SNAP_THRESHOLD, PROP_ANCHOR_SNAP_THRESHOLD_DEFAULT);
 	}
 
 //---------------------------------------------------------------------------------------------------------------------
@@ -326,8 +355,10 @@ namespace lvk
             const std::string motion_profile = obs_data_get_string(settings, PROP_MOTION_PROFILE);
             if(motion_profile == PROP_MOTION_PROFILE_FIXED)
             {
-                stab_settings.anchor_mode  = true;
-                stab_settings.anchor_decay = MOTION_PROFILE_FIXED_ANCHOR_DECAY;
+                stab_settings.anchor_mode           = true;
+                stab_settings.anchor_decay          = MOTION_PROFILE_FIXED_ANCHOR_DECAY;
+                stab_settings.anchor_snap_threshold =
+                    static_cast<float>(obs_data_get_double(settings, PROP_ANCHOR_SNAP_THRESHOLD)) * 0.01f;
             }
             else
             {

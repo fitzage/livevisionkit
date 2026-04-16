@@ -44,6 +44,7 @@ namespace lvk
         LVK_ASSERT_01(settings.response_rate);
         LVK_ASSERT_01(settings.release_rate);
         LVK_ASSERT_01(settings.anchor_decay);
+        LVK_ASSERT(settings.anchor_snap_threshold > 0.0f);
 
         // Reset state when switching between anchor and path-smoothing modes.
         if(m_Settings.anchor_mode != settings.anchor_mode)
@@ -93,17 +94,29 @@ namespace lvk
         LVK_ASSERT(motion.size() == m_Settings.motion_resolution);
 
         // ── Anchor mode (fixed/PTZ camera) ───────────────────────────────────
-        // Zero latency.  Accumulates the camera path and maintains a very slow
-        // EMA anchor.  Any deviation from the anchor is treated as vibration
-        // and corrected.  The anchor drifts toward the current position at
-        // anchor_decay per frame, so deliberate PTZ moves are gradually accepted.
+        // Zero latency.  Accumulates the camera path and maintains an EMA
+        // anchor.  Small motion (< snap_threshold) is treated as vibration
+        // and corrected.  Large motion (>= snap_threshold) is treated as an
+        // intentional PTZ move: the anchor snaps to the current position so
+        // the stabilizer stops fighting the deliberate reframe.
         if(m_Settings.anchor_mode)
         {
             m_Position += motion;
 
-            // anchor += anchor_decay * (position - anchor)
+            // Compute the per-frame motion magnitude (normalized to frame size).
+            float max_motion = 0.0f;
+            motion.read([&](const cv::Point2f& offset, const cv::Point& /*coord*/){
+                max_motion = std::max(max_motion, std::abs(offset.x));
+                max_motion = std::max(max_motion, std::abs(offset.y));
+            }, false);
+
+            // Snap anchor immediately for intentional moves; use slow decay for vibration.
+            const float decay = (max_motion >= m_Settings.anchor_snap_threshold)
+                ? 1.0f
+                : m_Settings.anchor_decay;
+
             auto drift = m_Position - m_Anchor;
-            drift *= m_Settings.anchor_decay;
+            drift *= decay;
             m_Anchor += drift;
 
             // Correction pushes the frame back toward the anchor.
