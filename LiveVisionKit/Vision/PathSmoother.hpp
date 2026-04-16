@@ -44,14 +44,21 @@ namespace lvk
         // drifting anchor point.  anchor_decay controls how fast the anchor
         // follows sustained (intentional) camera moves: lower = more stable
         // but slower to accept a deliberate PTZ repositioning.
-        // anchor_snap_threshold: if per-frame motion (as a fraction of frame
-        // size) exceeds this value, the anchor snaps to the current position
-        // immediately — treating the move as intentional PTZ rather than
-        // vibration.  Set lower to accept pans more eagerly; higher to
-        // require a larger motion before snapping.
-        bool  anchor_mode           = false;
-        float anchor_decay          = 0.003f;
-        float anchor_snap_threshold = 0.010f;
+        // anchor_snap_threshold: per-frame motion magnitude (as a fraction of
+        // frame size) that distinguishes vibration from intentional camera
+        // movement.  A door slam is an impulse that may briefly exceed this;
+        // a deliberate pan sustains it for many consecutive frames.
+        //
+        // anchor_ptz_hold_frames: how many consecutive frames must exceed
+        // anchor_snap_threshold before the stabilizer decides the motion is
+        // intentional and snaps the anchor.  Also how many consecutive quiet
+        // frames are needed to re-enter stabilization (symmetric hysteresis).
+        // Higher values reduce false PTZ triggers from vibration impulses but
+        // add a small detection lag at the start of a pan.
+        bool   anchor_mode            = false;
+        float  anchor_decay           = 0.003f;
+        float  anchor_snap_threshold  = 0.010f;
+        size_t anchor_ptz_hold_frames = 5;
     };
 
     class PathSmoother final : public Configurable<PathSmootherSettings>
@@ -80,6 +87,7 @@ namespace lvk
 
     private:
         std::atomic<bool> m_PtzActive{false};
+        size_t m_PanFrameCount = 0;
 
         double m_SmoothingFactor = 0.0f;
         double m_BaseSmoothingFactor = 0.0f;

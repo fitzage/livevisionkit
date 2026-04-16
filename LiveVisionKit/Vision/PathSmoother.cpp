@@ -45,6 +45,7 @@ namespace lvk
         LVK_ASSERT_01(settings.release_rate);
         LVK_ASSERT_01(settings.anchor_decay);
         LVK_ASSERT(settings.anchor_snap_threshold > 0.0f);
+        LVK_ASSERT(settings.anchor_ptz_hold_frames > 0);
 
         // Reset state when switching between anchor and path-smoothing modes.
         if(m_Settings.anchor_mode != settings.anchor_mode)
@@ -95,10 +96,21 @@ namespace lvk
 
         // ── Anchor mode (fixed/PTZ camera) ───────────────────────────────────
         // Zero latency.  Accumulates the camera path and maintains an EMA
-        // anchor.  Small motion (< snap_threshold) is treated as vibration
-        // and corrected.  Large motion (>= snap_threshold) is treated as an
-        // intentional PTZ move: the anchor snaps to the current position so
-        // the stabilizer stops fighting the deliberate reframe.
+        // anchor.  Vibration (short-lived motion) is corrected back to the
+        // anchor.  Intentional PTZ moves (sustained large motion) cause the
+        // anchor to snap so the stabilizer stops fighting the deliberate
+        // reframe.
+        //
+        // Detection uses a saturating frame counter with symmetric hysteresis:
+        //   - counter increments each frame motion >= anchor_snap_threshold
+        //   - counter decrements each frame motion <  anchor_snap_threshold
+        //   - snap mode engaged when counter == anchor_ptz_hold_frames
+        //   - snap mode released when counter == 0
+        //
+        // A door slam is an impulse (1–3 large frames); the counter never
+        // reaches the hold threshold so it is treated as vibration.  A pan
+        // sustains large motion long enough to reach the threshold.
+        // m_PtzActive (hotkey override) bypasses the counter entirely.
         if(m_Settings.anchor_mode)
         {
             m_Position += motion;
@@ -110,11 +122,14 @@ namespace lvk
                 max_motion = std::max(max_motion, std::abs(offset.y));
             }, false);
 
-            // Snap anchor immediately for intentional moves; use slow decay for vibration.
-            // m_PtzActive overrides the threshold: when a PTZ move is signalled externally
-            // (e.g. via hotkey), snap every frame regardless of measured motion magnitude.
+            // Update the saturating PTZ-detection counter.
+            if(max_motion >= m_Settings.anchor_snap_threshold)
+                m_PanFrameCount = std::min(m_PanFrameCount + 1, m_Settings.anchor_ptz_hold_frames);
+            else if(m_PanFrameCount > 0)
+                m_PanFrameCount--;
+
             const bool snap = m_PtzActive.load(std::memory_order_relaxed)
-                           || (max_motion >= m_Settings.anchor_snap_threshold);
+                           || (m_PanFrameCount >= m_Settings.anchor_ptz_hold_frames);
             const float decay = snap ? 1.0f : m_Settings.anchor_decay;
 
             auto drift = m_Position - m_Anchor;
@@ -197,6 +212,7 @@ namespace lvk
         m_Position.set_identity();
         m_Trace.set_identity();
         m_Anchor.set_identity();
+        m_PanFrameCount = 0;
     }
 
 //---------------------------------------------------------------------------------------------------------------------
