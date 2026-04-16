@@ -34,6 +34,8 @@ namespace lvk
 
 		explicit VSFilter(obs_source_t* context);
 
+		~VSFilter();
+
 		void configure(obs_data_t* settings);
 
 		bool validate() const;
@@ -55,6 +57,8 @@ namespace lvk
 
 		StabilizationFilter m_Filter;
 		bool m_TestMode = false;
+
+        obs_hotkey_id m_PtzHotkeyId = OBS_INVALID_HOTKEY_ID;
 	};
 
 }

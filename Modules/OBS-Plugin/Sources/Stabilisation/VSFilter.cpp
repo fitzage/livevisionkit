@@ -428,6 +428,26 @@ namespace lvk
 		LVK_ASSERT(context != nullptr);
 
         m_Filter.set_timing_samples(TIMING_SAMPLES);
+
+        // Register a hold-style hotkey: while held the anchor snaps every frame so
+        // the stabilizer does not fight deliberate PTZ pans or zooms.
+        m_PtzHotkeyId = obs_hotkey_register_source(
+            context,
+            "lvk_stabilizer_ptz_hold",
+            "Stabilizer: Hold During PTZ Move",
+            [](void* data, obs_hotkey_id, obs_hotkey_t*, bool pressed) {
+                static_cast<VSFilter*>(data)->m_Filter.set_ptz_active(pressed);
+            },
+            this
+        );
+    }
+
+//---------------------------------------------------------------------------------------------------------------------
+
+    VSFilter::~VSFilter()
+    {
+        if(m_PtzHotkeyId != OBS_INVALID_HOTKEY_ID)
+            obs_hotkey_unregister(m_PtzHotkeyId);
     }
 
 //---------------------------------------------------------------------------------------------------------------------

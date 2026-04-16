@@ -17,6 +17,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <opencv2/opencv.hpp>
 
 #include "Math/WarpMesh.hpp"
@@ -63,6 +64,12 @@ namespace lvk
 
         WarpMesh next(const WarpMesh& motion);
 
+        // Signal that a deliberate PTZ move is in progress.  While active the
+        // anchor snaps to the current position every frame, so no correction is
+        // applied and the stabilizer does not fight the intentional reframe.
+        // Safe to call from any thread (hotkey / UI thread).
+        void set_ptz_active(bool active) noexcept;
+
         void restart();
 
         size_t time_delay() const;
@@ -72,6 +79,8 @@ namespace lvk
         const cv::Rect2f& scene_margins() const;
 
     private:
+        std::atomic<bool> m_PtzActive{false};
+
         double m_SmoothingFactor = 0.0f;
         double m_BaseSmoothingFactor = 0.0f;
         StreamBuffer<WarpMesh> m_Trajectory{1};

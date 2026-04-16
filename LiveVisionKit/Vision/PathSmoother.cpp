@@ -111,9 +111,11 @@ namespace lvk
             }, false);
 
             // Snap anchor immediately for intentional moves; use slow decay for vibration.
-            const float decay = (max_motion >= m_Settings.anchor_snap_threshold)
-                ? 1.0f
-                : m_Settings.anchor_decay;
+            // m_PtzActive overrides the threshold: when a PTZ move is signalled externally
+            // (e.g. via hotkey), snap every frame regardless of measured motion magnitude.
+            const bool snap = m_PtzActive.load(std::memory_order_relaxed)
+                           || (max_motion >= m_Settings.anchor_snap_threshold);
+            const float decay = snap ? 1.0f : m_Settings.anchor_decay;
 
             auto drift = m_Position - m_Anchor;
             drift *= decay;
@@ -177,6 +179,13 @@ namespace lvk
         );
 
         return std::move(path_correction);
+    }
+
+//---------------------------------------------------------------------------------------------------------------------
+
+    void PathSmoother::set_ptz_active(bool active) noexcept
+    {
+        m_PtzActive.store(active, std::memory_order_relaxed);
     }
 
 //---------------------------------------------------------------------------------------------------------------------
