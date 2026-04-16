@@ -181,7 +181,12 @@ namespace lvk
 
     size_t PathSmoother::time_delay() const
     {
-        return m_Settings.anchor_mode ? 0 : m_Settings.predictive_samples;
+        // Anchor mode needs at least 1 frame of delay to avoid a StreamBuffer
+        // capacity-1 bug: after skip() empties a size-1 queue, advance_window()
+        // sees StartIndex==EndIndex and never increments m_Size on subsequent
+        // pushes, so is_full() never becomes true (all output is black).
+        // Returning 1 gives queue capacity 2, which works correctly.
+        return m_Settings.anchor_mode ? 1 : m_Settings.predictive_samples;
     }
 
 //---------------------------------------------------------------------------------------------------------------------
